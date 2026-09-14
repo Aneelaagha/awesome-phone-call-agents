@@ -20,7 +20,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
-const { buildCallGoal, loadResidents, maskPhone } = require("./build_call_goal.cjs");
+const { buildCallGoal, loadResidents } = require("./build_call_goal.cjs");
 
 // Real call transcripts are sensitive, so this must live outside public/
 // and dist/ -- anything in those directories is served as a static file
@@ -39,10 +39,12 @@ const CALLE_ENV = {
 /**
  * Runs `calle <args>` with an argument array (never a shell string), so
  * resident data such as names, topics, or family names can never be
- * interpreted as shell metacharacters. `sensitiveValues` are redacted out
- * of any error message before it's surfaced (e.g. to logs or an API
- * response) -- execFile still embeds the full argument list, including
- * the phone number, in a failed command's error message.
+ * interpreted as shell metacharacters. `sensitiveValues` (e.g. a phone
+ * number or the single-use confirm_token) are stripped out of any error
+ * message before it's surfaced (e.g. to logs or an API response) --
+ * execFile still embeds the full argument list in a failed command's
+ * error message, and a value like confirm_token is a credential, so it's
+ * replaced entirely rather than partially masked.
  */
 function runCalleCommand(args, sensitiveValues = []) {
   return new Promise((resolve, reject) => {
@@ -54,7 +56,7 @@ function runCalleCommand(args, sensitiveValues = []) {
         if (err) {
           let message = err.message;
           for (const value of sensitiveValues) {
-            if (value) message = message.split(value).join(maskPhone(value));
+            if (value) message = message.split(value).join("[REDACTED]");
           }
           return reject(new Error(message));
         }
@@ -84,7 +86,7 @@ async function planCall(resident, goal) {
 
 async function runCall(planId, confirmToken) {
   const args = ["call", "run", "--plan-id", planId, "--confirm-token", confirmToken];
-  const result = await runCalleCommand(args);
+  const result = await runCalleCommand(args, [confirmToken]);
   return JSON.parse(result.result.content[0].text);
 }
 
@@ -124,6 +126,31 @@ function detectDistress(transcript) {
 }
 
 /**
+ * A resident may read out a phone number during the call (their own, a
+ * family member's, a callback number) and CALL-E will faithfully put it
+ * in the transcript/summary text. Those free-text fields aren't a single
+ * known value like resident.phone, so instead of an exact match this
+ * scans for phone-number-shaped runs -- 7+ digits, optionally formatted
+ * with spaces, dashes, dots, or parentheses -- and masks all but the
+ * last 4 digits of each one. Applied before transcript/summary are
+ * printed to console or written to call_log.json, which the dashboard
+ * and GET /api/call-log both surface to the UI.
+ */
+function maskPhoneNumbersInText(text) {
+  if (!text) return text;
+  return text.replace(/\+?\d[\d\-.() ]{5,}\d/g, (match) => {
+    const digitCount = (match.match(/\d/g) || []).length;
+    if (digitCount < 7) return match;
+    const keep = 4;
+    let seen = 0;
+    return match.replace(/\d/g, (digit) => {
+      seen++;
+      return seen > digitCount - keep ? digit : "•";
+    });
+  });
+}
+
+/**
  * Very lightweight mood heuristic from the outcome + transcript.
  * Real deployments would use a proper sentiment model; this keeps the
  * report populated for the demo without overclaiming clinical accuracy.
@@ -137,8 +164,8 @@ function estimateMood(callResult) {
 }
 
 function buildEngagementRecord(resident, callResult) {
-  const transcript = callResult.result ? callResult.result.transcript : null;
-  const distressFlag = detectDistress(transcript);
+  const rawTranscript = callResult.result ? callResult.result.transcript : null;
+  const distressFlag = detectDistress(rawTranscript);
   const mood = distressFlag ? "flagged_for_review" : estimateMood(callResult);
   const durationSec = callResult.result && callResult.result.outcome
     ? null // CALL-E does not currently return duration in outcome; derived from activity timestamps if needed
@@ -155,8 +182,8 @@ function buildEngagementRecord(resident, callResult) {
       : false,
     mood,
     distressFlagged: distressFlag,
-    transcript,
-    summary: callResult.result ? callResult.result.summary : null,
+    transcript: maskPhoneNumbersInText(rawTranscript),
+    summary: maskPhoneNumbersInText(callResult.result ? callResult.result.summary : null),
   };
 }
 

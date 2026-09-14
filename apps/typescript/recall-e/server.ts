@@ -44,16 +44,39 @@ function pruneIdempotencyCache() {
   }
 }
 
-// Shared fail-closed gate for every endpoint that can expose real call or
-// transcript data. Dry-run preview data is harmless and stays key-free,
-// but anything real requires SENTINEL_API_KEY to be configured and
-// presented -- if DRY_RUN=false or a key has been configured, an absent
-// or wrong key is refused rather than silently allowed through.
+// Gate for the dialing endpoint only. Whether a request needs a key here
+// tracks whether it could place a REAL call: dry-run previews are harmless
+// (no call is placed, no real data returned) so they stay key-free, but
+// once DRY_RUN=false is set, or a key has been configured at all, an
+// absent or wrong key is refused rather than silently allowed through.
 // Returns true if the request may proceed; on false it has already sent
 // the response, so the caller should return immediately.
 function checkApiKeyRequired(req: Request, res: Response): boolean {
   const requiresApiKey = !DRY_RUN || Boolean(REQUIRED_API_KEY);
   if (!requiresApiKey) return true;
+  if (!REQUIRED_API_KEY) {
+    res.status(503).json({
+      error: 'Access to real call data is disabled: SENTINEL_API_KEY is not configured on the server.',
+    });
+    return false;
+  }
+  const providedKey = req.header('X-API-Key');
+  if (providedKey !== REQUIRED_API_KEY) {
+    res.status(401).json({ error: 'Missing or invalid X-API-Key.' });
+    return false;
+  }
+  return true;
+}
+
+// Gate for any route that reads real PERSISTED call/transcript data (e.g.
+// GET /api/call-log). This is a separate concern from the dialing gate
+// above: DRY_RUN only controls whether a NEW call is simulated instead of
+// placed -- it says nothing about whether OLD, already-recorded real
+// transcripts are safe to hand out, so a key is always required here
+// regardless of DRY_RUN. If no SENTINEL_API_KEY is configured at all,
+// this fails closed (refuses) rather than allowing unauthenticated reads
+// just because dry-run happens to be on.
+function requireApiKeyForRealData(req: Request, res: Response): boolean {
   if (!REQUIRED_API_KEY) {
     res.status(503).json({
       error: 'Access to real call data is disabled: SENTINEL_API_KEY is not configured on the server.',
@@ -169,10 +192,10 @@ app.post('/api/calls/place-real-call', (req: Request, res: Response) => {
 
 // Real call transcripts live at data/call_log.json (outside public/ and
 // dist/, so they're never reachable as a static file). This is the only
-// way the dashboard may read them -- gated by the same fail-closed
-// SENTINEL_API_KEY check as placing a real call.
+// way the dashboard may read them -- always gated by SENTINEL_API_KEY,
+// independent of DRY_RUN (see requireApiKeyForRealData above).
 app.get('/api/call-log', (req: Request, res: Response) => {
-  if (!checkApiKeyRequired(req, res)) return;
+  if (!requireApiKeyForRealData(req, res)) return;
 
   if (!fs.existsSync(CALL_LOG_PATH)) {
     return res.json({ calls: [] });
